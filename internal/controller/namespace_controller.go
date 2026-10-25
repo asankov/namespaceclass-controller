@@ -24,6 +24,7 @@ import (
 
 	namespaceclassv1alpha1 "github.com/asankov/namespaceclass/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -64,8 +65,7 @@ type preparedResource struct {
 // +kubebuilder:rbac:groups=core,resources=namespaces/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core,resources=namespaces/finalizers,verbs=update
 // +kubebuilder:rbac:groups=namespaceclass.akuity.io,resources=namespaceclasses,verbs=get;list;watch
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;create;patch
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;create;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -112,10 +112,6 @@ func (r *NamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{}, fmt.Errorf(
 				"error while validating NamespaceClass %q: %w", namespaceClassName, err,
 			)
-		}
-
-		if err := validateResources(objects); err != nil {
-			return ctrl.Result{}, fmt.Errorf("error while validating resources: %w", err)
 		}
 
 		preparedResources, err = r.prepareResources(&namespace, objects)
@@ -208,6 +204,14 @@ func decodeResources(resources []runtime.RawExtension) ([]unstructured.Unstructu
 	return objects, nil
 }
 
+// validateResources validates that the resources can be created by the controller.
+//
+// NOTE from the author: initially I created this function to verify we only create NetworkPolicy resources
+// because this is what the controller has permissions for.
+// Eventually, I decided to not use it, since the assignment mentioned creating resources of ANY kind.
+// For that to be possible we need to either:
+//   - give the controller RBAC permissions for `*:*` (not a good idea)
+//   - document the limitation and expect that the user of this controller will provide a ServiceAccount with proper permissions to the controller.
 func validateResources(resources []unstructured.Unstructured) error {
 	for _, r := range resources {
 		// for now, we only allow resources of type NetwotkPolicy to be created
@@ -271,6 +275,10 @@ func (r *NamespaceReconciler) syncResources(ctx context.Context, namespace *core
 		return false, err
 	}
 
+	if len(resources) == 0 && len(inventory) == 0 {
+		return false, nil
+	}
+
 	desired := make(map[string]struct{}, len(resources))
 
 	for _, resource := range resources {
@@ -315,25 +323,7 @@ func (r *NamespaceReconciler) applyDesiredResources(ctx context.Context, namespa
 	for _, resource := range resources {
 		key := resourceKey(resource.Resource, resource.Object.GetName())
 		entry := inventory[key]
-		api := r.Dynamic.Resource(resource.Resource).Namespace(namespace.Name)
-
-		before, err := api.Get(ctx, entry.Name, v1.GetOptions{})
-		if err != nil {
-			if !apierrors.IsNotFound(err) {
-				return err
-			}
-			// not found: continue so applyResource can create it.
-		} else {
-			if entry.UID != "" && before.GetUID() != entry.UID {
-				// if we are here it means that someone deleted our resource and created one with the same name
-				return fmt.Errorf(
-					"managed resource %s %q was replaced",
-					resource.Object.GetKind(), entry.Name,
-				)
-			}
-		}
-
-		applied, err := r.applyResource(ctx, namespace, resource)
+		applied, err := r.applyResource(ctx, namespace, resource, entry.UID)
 		if err != nil {
 			return err
 		}
@@ -391,14 +381,14 @@ func (r *NamespaceReconciler) deleteObsoleteResources(ctx context.Context, names
 
 		// if we are here it means either:
 		// - we requested deletion for that object
-		// - deletion is already requested (current.GetDeletionTimestamp().IsZero() == true) but it has not completed
+		// - deletion is already requested (current.GetDeletionTimestamp().IsZero() == false) but it has not completed
 		hasPendingDeletion = true
 	}
 
 	return hasPendingDeletion, nil
 }
 
-func (r *NamespaceReconciler) applyResource(ctx context.Context, namespace *corev1.Namespace, resource preparedResource) (*unstructured.Unstructured, error) {
+func (r *NamespaceReconciler) applyResource(ctx context.Context, namespace *corev1.Namespace, resource preparedResource, expectedUID types.UID) (*unstructured.Unstructured, error) {
 	object := resource.Object.DeepCopy()
 	api := r.Dynamic.Resource(resource.Resource).Namespace(namespace.Name)
 
@@ -413,6 +403,10 @@ func (r *NamespaceReconciler) applyResource(ctx context.Context, namespace *core
 
 	if err != nil {
 		return nil, fmt.Errorf("error while getting %s %q: %w", object.GetKind(), object.GetName(), err)
+	}
+
+	if expectedUID != "" && existing.GetUID() != expectedUID {
+		return nil, fmt.Errorf("managed resource %s %q was replaced", object.GetKind(), object.GetName())
 	}
 
 	if !ownsResource(namespace, existing) {
@@ -456,6 +450,7 @@ func (r *NamespaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Namespace{}).
+		Owns(&networkingv1.NetworkPolicy{}).
 		Watches(&namespaceclassv1alpha1.NamespaceClass{}, handler.EnqueueRequestsFromMapFunc(r.namespacesForNamespaceClass)).
 		Named("namespace").
 		Complete(r)

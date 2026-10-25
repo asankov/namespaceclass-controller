@@ -6,6 +6,20 @@
 
 ## Getting Started
 
+### Managed resource permissions
+
+NamespaceClasses can contain any installed namespaced resource kind. The bundled
+controller role grants management permissions for NetworkPolicies. To use other
+kinds, grant the controller service account `get`, `create`, `patch`, and `delete`
+permissions for those resources through an additional ClusterRole and binding.
+Cluster-scoped resources are rejected.
+
+Namespace and NamespaceClass changes reconcile all configured kinds. Owned
+NetworkPolicies are also watched so manual edits and deletions trigger repair.
+Other kinds currently reconcile when their Namespace or NamespaceClass changes;
+add an ownership watch and `list`/`watch` permissions for immediate repair of those
+kinds.
+
 ### Prerequisites
 - go version v1.24.6+
 - docker version 17.03+.

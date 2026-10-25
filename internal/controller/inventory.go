@@ -29,18 +29,22 @@ func resourceKey(resource schema.GroupVersionResource, name string) string {
 }
 
 func readInventory(namespace *corev1.Namespace) (inventory, error) {
-	inventory := make(inventory)
+	records := make(inventory)
 
 	data := namespace.Annotations[inventoryAnnotation]
 	if data == "" {
-		return inventory, nil
+		return records, nil
 	}
 
-	if err := json.Unmarshal([]byte(data), &inventory); err != nil {
+	if err := json.Unmarshal([]byte(data), &records); err != nil {
 		return nil, fmt.Errorf("error while unmarshalling inventory: %w", err)
 	}
 
-	return inventory, nil
+	if records == nil {
+		records = make(inventory)
+	}
+
+	return records, nil
 }
 
 func (r *NamespaceReconciler) saveInventory(ctx context.Context, namespace *corev1.Namespace, inventory inventory) error {
