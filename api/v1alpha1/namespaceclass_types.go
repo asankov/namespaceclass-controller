@@ -26,14 +26,11 @@ import (
 
 // NamespaceClassSpec defines the desired state of NamespaceClass
 type NamespaceClassSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
-
-	// foo is an example field of NamespaceClass. Edit namespaceclass_types.go to remove/update
-	// +optional
-	Foo *string `json:"foo,omitempty"`
+	// resources is a list of resources that will be created for all namespaces associated with this NamespaceClass.
+	// +listType=atomic
+	// +kubebuilder:validation:items:EmbeddedResource
+	// +kubebuilder:validation:Required
+	Resources []runtime.RawExtension `json:"resources"`
 }
 
 // NamespaceClassStatus defines the observed state of NamespaceClass.
