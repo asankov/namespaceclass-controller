@@ -18,8 +18,11 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
+	namespaceclassv1alpha1 "github.com/asankov/namespaceclass/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -35,6 +38,7 @@ type NamespaceReconciler struct {
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=namespaces/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core,resources=namespaces/finalizers,verbs=update
+// +kubebuilder:rbac:groups=namespaceclass.akuity.io,resources=namespaceclasses,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -46,10 +50,38 @@ type NamespaceReconciler struct {
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.25.0/pkg/reconcile
 func (r *NamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	_ = logf.FromContext(ctx)
+	log := logf.FromContext(ctx)
 
-	// TODO(user): your logic here
+	var namespace corev1.Namespace
+	if err := r.Get(ctx, client.ObjectKey{Name: req.Name}, &namespace); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
 
+	if !namespace.DeletionTimestamp.IsZero() {
+		// ignore namespace being deleted
+		return ctrl.Result{}, nil
+	}
+
+	namespaceClassName, ok := namespace.Labels["namespaceclass.akuity.io/name"]
+	if !ok {
+		// namespace has no namespace class, skip
+		return ctrl.Result{}, nil
+	}
+
+	var namespaceClass namespaceclassv1alpha1.NamespaceClass
+	if err := r.Get(ctx, client.ObjectKey{Name: namespaceClassName}, &namespaceClass); err != nil {
+		if apierrors.IsNotFound(err) {
+			// log an error, but do not fail the reconcile, because it might get stuck in a loop
+			log.Info("referenced namespace class not found", "namespaceClass", namespaceClassName)
+			return ctrl.Result{}, nil
+		}
+
+		return ctrl.Result{}, fmt.Errorf("error while getting NamespaceClass: %w", err)
+	}
+
+	log.Info(fmt.Sprintf("Namspace [%s] has NamespaceClass [%s]", req.Name, namespaceClass.Name))
+
+	// TODO(asankov): apply resources
 	return ctrl.Result{}, nil
 }
 

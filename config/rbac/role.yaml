@@ -30,3 +30,11 @@ rules:
   - get
   - patch
   - update
+- apiGroups:
+  - namespaceclass.akuity.io
+  resources:
+  - namespaceclasses
+  verbs:
+  - get
+  - list
+  - watch
