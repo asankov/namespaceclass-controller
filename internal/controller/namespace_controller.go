@@ -34,7 +34,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const fieldManager = "namespaceclass-controller"
@@ -282,8 +284,34 @@ func (r *NamespaceReconciler) applyResource(ctx context.Context, namespace *core
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *NamespaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Namespace{}, "namespaceclass.name", namespaceClassIndexValues); err != nil {
+		return fmt.Errorf("error while indexing Namespaces by NamespaceClass: %w", err)
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Namespace{}).
+		Watches(&namespaceclassv1alpha1.NamespaceClass{}, handler.EnqueueRequestsFromMapFunc(r.namespacesForNamespaceClass)).
 		Named("namespace").
 		Complete(r)
+}
+
+func (r *NamespaceReconciler) namespacesForNamespaceClass(ctx context.Context, namespaceClass client.Object) []reconcile.Request {
+	var namespaces corev1.NamespaceList
+	if err := r.List(ctx, &namespaces, client.MatchingFields{"namespaceclass.name": namespaceClass.GetName()}); err != nil {
+		logf.FromContext(ctx).Error(err, "error while listing Namespaces for NamespaceClass", "namespaceClass", namespaceClass.GetName())
+		return nil
+	}
+
+	requests := make([]reconcile.Request, 0, len(namespaces.Items))
+	for _, namespace := range namespaces.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKey{Name: namespace.Name}})
+	}
+	return requests
+}
+
+func namespaceClassIndexValues(object client.Object) []string {
+	if name := object.GetLabels()["namespaceclass.akuity.io/name"]; name != "" {
+		return []string{name}
+	}
+	return nil
 }
