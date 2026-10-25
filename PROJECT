@@ -8,4 +8,12 @@ layout:
 - go.kubebuilder.io/v4
 projectName: namespaceclass
 repo: github.com/asankov/namespaceclass
+resources:
+- api:
+    crdVersion: v1
+  domain: akuity.io
+  group: namespaceclass
+  kind: NamespaceClass
+  path: github.com/asankov/namespaceclass/api/v1alpha1
+  version: v1alpha1
 version: "3"
