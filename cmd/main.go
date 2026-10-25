@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	namespaceclassv1alpha1 "github.com/asankov/namespaceclass/api/v1alpha1"
+	"github.com/asankov/namespaceclass/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -181,6 +182,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := (&controller.NamespaceReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "namespace")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
