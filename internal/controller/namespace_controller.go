@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	namespaceclassv1alpha1 "github.com/asankov/namespaceclass/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -39,7 +40,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-const fieldManager = "namespaceclass-controller"
+const (
+	fieldManager = "namespaceclass-controller"
+
+	requeueDuration = 5 * time.Second
+)
 
 // NamespaceReconciler reconciles a Namespace object
 type NamespaceReconciler struct {
@@ -60,6 +65,7 @@ type preparedResource struct {
 // +kubebuilder:rbac:groups=core,resources=namespaces/finalizers,verbs=update
 // +kubebuilder:rbac:groups=namespaceclass.akuity.io,resources=namespaceclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;create;patch
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;create;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -83,46 +89,57 @@ func (r *NamespaceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
-	namespaceClassName, ok := namespace.Labels["namespaceclass.akuity.io/name"]
-	if !ok {
-		// namespace has no namespace class, skip
-		return ctrl.Result{}, nil
-	}
+	var preparedResources []preparedResource
 
-	var namespaceClass namespaceclassv1alpha1.NamespaceClass
-	if err := r.Get(ctx, client.ObjectKey{Name: namespaceClassName}, &namespaceClass); err != nil {
-		if apierrors.IsNotFound(err) {
-			// log an error, but do not fail the reconcile, because it might get stuck in a loop
-			log.Info("referenced namespace class not found", "namespaceClass", namespaceClassName)
-			return ctrl.Result{}, nil
+	namespaceClassName := namespace.Labels["namespaceclass.akuity.io/name"]
+
+	// if namespace has a namespace class - read it and prepare all resources for creation
+	if namespaceClassName != "" {
+		var namespaceClass namespaceclassv1alpha1.NamespaceClass
+		if err := r.Get(ctx, client.ObjectKey{Name: namespaceClassName}, &namespaceClass); err != nil {
+			if apierrors.IsNotFound(err) {
+				// log an error, but do not fail the reconcile, because it might get stuck in a loop
+				log.Info("referenced namespace class not found", "namespaceClass", namespaceClassName)
+				return ctrl.Result{}, nil
+			}
+
+			return ctrl.Result{}, fmt.Errorf("error while getting NamespaceClass: %w", err)
+		}
+		log.Info(fmt.Sprintf("Namespace [%s] has NamespaceClass [%s]", req.Name, namespaceClass.Name))
+
+		objects, err := decodeResources(namespaceClass.Spec.Resources)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf(
+				"error while validating NamespaceClass %q: %w", namespaceClassName, err,
+			)
 		}
 
-		return ctrl.Result{}, fmt.Errorf("error while getting NamespaceClass: %w", err)
+		if err := validateResources(objects); err != nil {
+			return ctrl.Result{}, fmt.Errorf("error while validating resources: %w", err)
+		}
+
+		preparedResources, err = r.prepareResources(&namespace, objects)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
-	log.Info(fmt.Sprintf("Namespace [%s] has NamespaceClass [%s]", req.Name, namespaceClass.Name))
-
-	objects, err := decodeResources(namespaceClass.Spec.Resources)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf(
-			"error while validating NamespaceClass %q: %w", namespaceClassName, err,
-		)
-	}
-
-	if err := validateResources(objects); err != nil {
-		return ctrl.Result{}, fmt.Errorf("error while validating resources: %w", err)
-	}
-
-	preparedResources, err := r.prepareResources(&namespace, objects)
+	// we call syncResources regardless or not of whether namespace has a namespace class
+	// 	- for namespaces that never had namespace class - this call will be a no-op
+	// 	- for namespaces that had changed namespace classes - this will replace resources
+	// 	- for namespaces whose namespace class changes - this call will apply the new resources and delete the stale ones
+	hasPendingDeletion, err := r.syncResources(ctx, &namespace, preparedResources)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if err := r.applyResources(ctx, &namespace, preparedResources); err != nil {
-		return ctrl.Result{}, err
+	if hasPendingDeletion {
+		log.Info("Applied resources; waiting for pending deletions", "namespace", req.Name, "requeueAfter", requeueDuration.String())
+
+		return ctrl.Result{RequeueAfter: requeueDuration}, nil
 	}
 
-	log.Info(fmt.Sprintf("All resources applied succesfully to namespace [%s]", req.Name))
+	log.Info("Applied resources successfully", "namespace", req.Name)
 
 	return ctrl.Result{}, nil
 }
@@ -222,6 +239,20 @@ func (r *NamespaceReconciler) prepareResources(namespace *corev1.Namespace, obje
 
 		object.SetNamespace(namespace.Name)
 
+		annotations := object.GetAnnotations()
+		if annotations == nil {
+			annotations = make(map[string]string)
+		}
+		annotations[managedByAnnotation] = fieldManager
+		object.SetAnnotations(annotations)
+
+		// object in the NamespaceClass should not have an owner since it will be owned by the namespace.
+		if len(object.GetOwnerReferences()) != 0 {
+			return nil, fmt.Errorf(
+				"resources[%d]: metadata.ownerReferences must be omitted", i,
+			)
+		}
+
 		if err := controllerutil.SetControllerReference(namespace, object, r.Scheme); err != nil {
 			return nil, fmt.Errorf("error while setting controller reference to %s %q: %w", gvk, object.GetName(), err)
 		}
@@ -234,35 +265,158 @@ func (r *NamespaceReconciler) prepareResources(namespace *corev1.Namespace, obje
 	return preparedResources, nil
 }
 
-func (r *NamespaceReconciler) applyResources(ctx context.Context, namespace *corev1.Namespace, resources []preparedResource) error {
+func (r *NamespaceReconciler) syncResources(ctx context.Context, namespace *corev1.Namespace, resources []preparedResource) (hasPendingDeletion bool, err error) {
+	inventory, err := readInventory(namespace)
+	if err != nil {
+		return false, err
+	}
+
+	desired := make(map[string]struct{}, len(resources))
+
 	for _, resource := range resources {
-		if err := r.applyResource(ctx, namespace, resource); err != nil {
+		key := resourceKey(resource.Resource, resource.Object.GetName())
+		desired[key] = struct{}{}
+
+		entry, ok := inventory[key]
+		if ok {
+			// Preserve the recorded UID and just refresh the API version.
+			entry.Resource = resource.Resource
+		} else {
+			entry = managedResource{
+				Resource: resource.Resource,
+				Name:     resource.Object.GetName(),
+				// UID is empty here, which means the record should be created
+			}
+		}
+		inventory[key] = entry
+	}
+
+	if err := r.saveInventory(ctx, namespace, inventory); err != nil {
+		return false, err
+	}
+
+	if err := r.applyDesiredResources(ctx, namespace, resources, inventory); err != nil {
+		return false, err
+	}
+
+	hasPendingDeletion, err = r.deleteObsoleteResources(ctx, namespace, desired, inventory)
+	if err != nil {
+		return false, err
+	}
+
+	if err := r.saveInventory(ctx, namespace, inventory); err != nil {
+		return false, err
+	}
+
+	return hasPendingDeletion, nil
+}
+
+func (r *NamespaceReconciler) applyDesiredResources(ctx context.Context, namespace *corev1.Namespace, resources []preparedResource, inventory inventory) error {
+	for _, resource := range resources {
+		key := resourceKey(resource.Resource, resource.Object.GetName())
+		entry := inventory[key]
+		api := r.Dynamic.Resource(resource.Resource).Namespace(namespace.Name)
+
+		before, err := api.Get(ctx, entry.Name, v1.GetOptions{})
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				return err
+			}
+			// not found: continue so applyResource can create it.
+		} else {
+			if entry.UID != "" && before.GetUID() != entry.UID {
+				// if we are here it means that someone deleted our resource and created one with the same name
+				return fmt.Errorf(
+					"managed resource %s %q was replaced",
+					resource.Object.GetKind(), entry.Name,
+				)
+			}
+		}
+
+		applied, err := r.applyResource(ctx, namespace, resource)
+		if err != nil {
+			return err
+		}
+
+		entry.UID = applied.GetUID()
+		inventory[key] = entry
+
+		if err := r.saveInventory(ctx, namespace, inventory); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
-func (r *NamespaceReconciler) applyResource(ctx context.Context, namespace *corev1.Namespace, resource preparedResource) error {
+func (r *NamespaceReconciler) deleteObsoleteResources(ctx context.Context, namespace *corev1.Namespace, desired map[string]struct{}, inventory inventory) (hasPendingDeletion bool, err error) {
+	hasPendingDeletion = false
+
+	for key, entry := range inventory {
+		if _, wanted := desired[key]; wanted {
+			continue
+		}
+
+		api := r.Dynamic.Resource(entry.Resource).Namespace(namespace.Name)
+		current, err := api.Get(ctx, entry.Name, v1.GetOptions{})
+
+		if apierrors.IsNotFound(err) {
+			delete(inventory, key)
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("error while getting obsolete resource %q: %w", entry.Name, err)
+		}
+
+		// A replaced or unrelated object must never be deleted.
+		if !ownsResource(namespace, current) ||
+			(entry.UID != "" && current.GetUID() != entry.UID) {
+			logf.FromContext(ctx).Info("Stopped tracking resource with different identity or ownership", "resource", entry.Resource.String(), "name", entry.Name)
+			delete(inventory, key)
+			continue
+		}
+
+		if current.GetDeletionTimestamp().IsZero() {
+			uid := current.GetUID()
+			resourceVersion := current.GetResourceVersion()
+
+			err := api.Delete(ctx, entry.Name, v1.DeleteOptions{Preconditions: &v1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion}})
+			if apierrors.IsNotFound(err) {
+				delete(inventory, key)
+				continue
+			}
+			if err != nil {
+				return false, fmt.Errorf("error while deleting obsolete resource %q: %w", entry.Name, err)
+			}
+		}
+
+		// if we are here it means either:
+		// - we requested deletion for that object
+		// - deletion is already requested (current.GetDeletionTimestamp().IsZero() == true) but it has not completed
+		hasPendingDeletion = true
+	}
+
+	return hasPendingDeletion, nil
+}
+
+func (r *NamespaceReconciler) applyResource(ctx context.Context, namespace *corev1.Namespace, resource preparedResource) (*unstructured.Unstructured, error) {
 	object := resource.Object.DeepCopy()
 	api := r.Dynamic.Resource(resource.Resource).Namespace(namespace.Name)
 
 	existing, err := api.Get(ctx, object.GetName(), v1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		if _, err := api.Create(ctx, object, v1.CreateOptions{FieldManager: fieldManager}); err != nil {
-			return fmt.Errorf("error while creating %s %q: %w", object.GetKind(), object.GetName(), err)
+		created, err := api.Create(ctx, object, v1.CreateOptions{FieldManager: fieldManager})
+		if err != nil {
+			return nil, fmt.Errorf("error while creating %s %q: %w", object.GetKind(), object.GetName(), err)
 		}
-		return nil
+		return created, nil
 	}
 
 	if err != nil {
-		return fmt.Errorf("error while getting %s %q: %w", object.GetKind(), object.GetName(), err)
+		return nil, fmt.Errorf("error while getting %s %q: %w", object.GetKind(), object.GetName(), err)
 	}
 
-	owner := v1.GetControllerOf(existing)
-	if owner == nil || owner.APIVersion != "v1" || owner.Kind != "Namespace" || owner.Name != namespace.Name || owner.UID != namespace.UID {
-		return fmt.Errorf("resource %s %q is not owned by Namespace %q", object.GetKind(), object.GetName(), namespace.Name)
+	if !ownsResource(namespace, existing) {
+		return nil, fmt.Errorf("resource %s %q is not owned by Namespace %q", object.GetKind(), object.GetName(), namespace.Name)
 	}
 
 	// this would make the apply fail if someone else already modified the object
@@ -270,16 +424,28 @@ func (r *NamespaceReconciler) applyResource(ctx context.Context, namespace *core
 
 	data, err := json.Marshal(object)
 	if err != nil {
-		return fmt.Errorf("error while encoding %s %q: %w", object.GetKind(), object.GetName(), err)
+		return nil, fmt.Errorf("error while encoding %s %q: %w", object.GetKind(), object.GetName(), err)
 	}
 
-	if _, err := api.Patch(ctx, object.GetName(), types.ApplyPatchType, data, v1.PatchOptions{FieldManager: fieldManager}); err != nil {
-		return fmt.Errorf(
+	patched, err := api.Patch(ctx, object.GetName(), types.ApplyPatchType, data, v1.PatchOptions{FieldManager: fieldManager})
+	if err != nil {
+		return nil, fmt.Errorf(
 			"apply %s %q: %w", object.GetKind(), object.GetName(), err,
 		)
 	}
 
-	return nil
+	return patched, nil
+}
+
+func ownsResource(namespace *corev1.Namespace, object *unstructured.Unstructured) bool {
+	owner := v1.GetControllerOf(object)
+
+	return object.GetAnnotations()[managedByAnnotation] == fieldManager &&
+		owner != nil &&
+		owner.APIVersion == "v1" &&
+		owner.Kind == "Namespace" &&
+		owner.Name == namespace.Name &&
+		owner.UID == namespace.UID
 }
 
 // SetupWithManager sets up the controller with the Manager.
