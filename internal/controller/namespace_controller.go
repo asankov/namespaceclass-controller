@@ -402,6 +402,16 @@ func (r *NamespaceReconciler) applyResource(ctx context.Context, namespace *core
 	}
 
 	if err != nil {
+		if apierrors.IsForbidden(err) {
+			return nil, fmt.Errorf(
+				"controller lacks permission to read %s %q in namespace %q; grant its ServiceAccount 'get' access to resource %q in API group %q",
+				object.GetKind(),
+				object.GetName(),
+				namespace.Name,
+				resource.Resource.Resource,
+				resource.Resource.Group,
+			)
+		}
 		return nil, fmt.Errorf("error while getting %s %q: %w", object.GetKind(), object.GetName(), err)
 	}
 
@@ -424,7 +434,7 @@ func (r *NamespaceReconciler) applyResource(ctx context.Context, namespace *core
 	patched, err := api.Patch(ctx, object.GetName(), types.ApplyPatchType, data, v1.PatchOptions{FieldManager: fieldManager})
 	if err != nil {
 		return nil, fmt.Errorf(
-			"apply %s %q: %w", object.GetKind(), object.GetName(), err,
+			"error while applying %s %q: %w", object.GetKind(), object.GetName(), err,
 		)
 	}
 
